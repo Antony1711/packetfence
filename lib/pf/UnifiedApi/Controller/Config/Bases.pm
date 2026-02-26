@@ -2,7 +2,7 @@ package pf::UnifiedApi::Controller::Config::Bases;
 
 =head1 NAME
 
-pf::UnifiedApi::Controller::Config::Bases - 
+pf::UnifiedApi::Controller::Config::Bases -
 
 =cut
 
@@ -248,7 +248,7 @@ sub database_assign {
     if ($json->{is_remote}) {
         my $remote = $json->{remote};
         my %database_proxysql = (
-            status => 'enabled',
+            status => 'true',
             backend => $remote->{host},
         );
         if ($remote->{ca_cert}) {
