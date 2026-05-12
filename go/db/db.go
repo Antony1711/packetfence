@@ -78,6 +78,7 @@ func ReturnURI(ctx context.Context, user, pass, host, port, dbName string) strin
 	port = strings.TrimSpace(port)
 	dbName = strings.TrimSpace(dbName)
 	location, _ := time.LoadLocation("Local")
+	options := []mysql.Option{}
 
 	proto := "tcp"
 
@@ -86,6 +87,7 @@ func ReturnURI(ctx context.Context, user, pass, host, port, dbName string) strin
 		host = "/var/lib/mysql/mysql.sock"
 	} else {
 		host = host + ":" + port
+		options = append(options, mysql.EnableCompression(true))
 	}
 
 	Config := mysql.NewConfig()
@@ -99,9 +101,7 @@ func ReturnURI(ctx context.Context, user, pass, host, port, dbName string) strin
 	Config.ParseTime = true
 	Config.Loc = location
 	Config.Params = map[string]string{"sql_mode": sqlMode}
-	Config.Apply(
-		mysql.EnableCompression(true),
-	)
+	Config.Apply(options...)
 
 	return Config.FormatDSN()
 }
