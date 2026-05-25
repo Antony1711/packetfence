@@ -128,11 +128,19 @@ sub returnRadiusAccessAccept {
     if ( isenabled($self->{_AccessListMap}) && $self->supportsAccessListBasedEnforcement ){
         if( defined($args->{'user_role'}) && $args->{'user_role'} ne "" && !($self->usePushACLs && exists $ConfigRoles{$args->{'user_role'}} ) && defined(my $access_list = $self->getAccessListByName($args->{'user_role'}, $args->{mac}, $args->{ifIndex}))){
             if ($access_list) {
-                while($access_list =~ /([^\n]+)\n?/g){
-                    my ($test, $formated_acl) = $self->returnAccessListAttribute('',$1);
-                    if ($test) {
-                        push(@acls, $formated_acl);
-                        $logger->info("(".$self->{'_id'}.") Adding access list : $formated_acl to the RADIUS reply");
+                for my $line (split /\n/, $access_list) {
+                    # Defensive re-split: if two rules got fused into one
+                    # element upstream, break them apart on the rule-start
+                    # boundary so each NAS-Filter-Rule attribute holds
+                    # exactly one rule.
+                    for my $part (split /(?=(?:permit|deny)\s+in\s+)/, $line) {
+                        $part =~ s/^\s+|\s+$//g;
+                        next if $part eq '';
+                        my ($test, $formated_acl) = $self->returnAccessListAttribute('', $part);
+                        if ($test) {
+                            push(@acls, $formated_acl);
+                            $logger->info("(".$self->{'_id'}.") Adding access list : $formated_acl to the RADIUS reply");
+                        }
                     }
                 }
                 $logger->info("(".$self->{'_id'}.") Added access lists to the RADIUS reply.");
@@ -206,6 +214,13 @@ sub acl_chewer {
     my $logger = $self->logger;
     my ($acl_ref, @direction) = $self->format_acl($acl);
 
+    $logger->debug(sub {
+        require Data::Dumper;
+        local $Data::Dumper::Sortkeys = 1;
+        "(".$self->{'_id'}.") acl_chewer parser entries: "
+            . Data::Dumper::Dumper($acl_ref->{'packetfence'}->{'entries'});
+    });
+
     my $acl_chewed;
     foreach my $acl_entry (@{$acl_ref->{'packetfence'}->{'entries'}}) {
         # Strip protocol code (e.g., tcp(6) -> tcp)
@@ -256,6 +271,9 @@ sub acl_chewer {
             } else {
                 # eq 80 -> 80, gt 1024 -> extract number
                 $dest_port =~ s/\w+\s+//;
+                # Truncate anything past the port number — guards against the
+                # parser leaking the next rule's tokens into this field.
+                $dest_port =~ s/[^0-9\-].*//s;
             }
         }
 
