@@ -2089,9 +2089,11 @@ deploy_release_website_artifacts:
 # cleanup runs even if test jobs failed. Inlining rather than extending
 # .bake_img_vagrant_rules because GitLab CI doesn't propagate a job-level
 # `when:` into rules inherited via `extends:`.
+# No `needs:` keyword: the deploy stage waits for test to finish via
+# traditional stage ordering, which is what we want — running before tests
+# complete would delete the .box while jobs are still using it.
 cleanup_golden_images:
   stage: deploy
-  needs: []
   dependencies: []
   variables:
     GOLDEN_BOX_DIR: /var/local/gitlab-runner/golden_images/${CI_PIPELINE_ID}
