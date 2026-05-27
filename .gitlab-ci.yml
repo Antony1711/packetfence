@@ -16,6 +16,7 @@ stages:
   - build_artifacts
   - sign
   - publish
+  - bake_img
   - test
   - deploy
   - build_pf_img
@@ -212,6 +213,17 @@ variables:
     - if: '$CI_COMMIT_REF_NAME != "devel" && $CI_COMMIT_REF_NAME !~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
     - if: '$CI_COMMIT_REF_NAME != "devel" && $CI_COMMIT_REF_NAME !~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && $CI_PIPELINE_SOURCE == "schedule" && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
 
+# Union of .test_devel_and_maintenance_rules + .test_branches_only_rules:
+# the bake_img_vagrant_* job must run whenever ANY golden-eligible test
+# job runs, so its rules cover both devel/maintenance and feature branches.
+.bake_img_vagrant_rules:
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "devel" && $CI_PIPELINE_SOURCE != "schedule" && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+    - if: '$CI_COMMIT_REF_NAME =~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+    - if: '( $CI_COMMIT_REF_NAME == "devel" || $CI_COMMIT_REF_NAME =~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/) && $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_TAG == null && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+    - if: '$CI_COMMIT_REF_NAME != "devel" && $CI_COMMIT_REF_NAME !~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+    - if: '$CI_COMMIT_REF_NAME != "devel" && $CI_COMMIT_REF_NAME !~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && $CI_PIPELINE_SOURCE == "schedule" && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+
 # run jobs only when:
 # - on all branches (maintenance/X.Y branches included) and devel with a schedule
 .check_devel_branches_and_maintenance_rules:
@@ -373,6 +385,24 @@ variables:
   tags:
     - shell
     - inverse.ca
+
+# Build the per-pipeline golden Vagrant box (PF VM provisioned + configurator
+# wizard pre-run). Consumed by all golden-opted test jobs in the same
+# pipeline so they skip site.yml and the 7-step configurator wizard.
+# The .box is written to /var/local/gitlab-runner/golden_images/${CI_PIPELINE_ID}/
+# on the shared runner FS and purged by cleanup_golden_images at the end.
+.bake_img_vagrant_job:
+  stage: bake_img
+  dependencies: []
+  variables:
+    VAGRANT_PF_DOTFILE_PATH: /var/local/gitlab-runner/vagrant/bake-${CI_PIPELINE_ID}-${BAKE_ARCH}
+    GOLDEN_BOX_DIR: /var/local/gitlab-runner/golden_images/${CI_PIPELINE_ID}
+  script:
+    - timeout ${PIPELINE_TIMEOUT_SCRIPT} ${CILIBDIR}/bake/bake-vagrant-img.sh run
+  after_script:
+    - timeout ${PIPELINE_TIMEOUT_CLEANUP} ${CILIBDIR}/bake/bake-vagrant-img.sh teardown
+  tags:
+    - test-shell-v7
 
 .build_artifacts_pkg_job:
   stage: build_artifacts
@@ -602,6 +632,31 @@ variables:
 .deb_script_job:
   script:
     - make -e build_deb
+
+# Test jobs that opt INTO the per-pipeline golden Vagrant box append one of
+# these to their `extends` list. The bake job dependency makes the test wait
+# for the golden box to be built; the env vars switch test-wrapper.sh into
+# the golden-box code path (skip site.yml on PF VM, skip configurator
+# scenario). configurator_*, pfappserver_*, and *_pristine jobs intentionally
+# don't extend these — they exercise the full provisioning + configurator
+# path.
+.test_job_golden_el8:
+  needs:
+    - bake_img_vagrant_el8
+  variables:
+    USE_GOLDEN_BOX: "yes"
+    GOLDEN_BOX_VERSION: "0.0.${CI_PIPELINE_ID}"
+    GOLDEN_BOX_DIR: /var/local/gitlab-runner/golden_images/${CI_PIPELINE_ID}
+    SKIP_CONFIGURATOR_BAKED: "yes"
+
+.test_job_golden_deb12:
+  needs:
+    - bake_img_vagrant_deb12
+  variables:
+    USE_GOLDEN_BOX: "yes"
+    GOLDEN_BOX_VERSION: "0.0.${CI_PIPELINE_ID}"
+    GOLDEN_BOX_DIR: /var/local/gitlab-runner/golden_images/${CI_PIPELINE_ID}
+    SKIP_CONFIGURATOR_BAKED: "yes"
 
 .test_script_job:
   variables:
@@ -1144,6 +1199,29 @@ build_img_vagrant_devel_and_branches_debian_bookworm:
     BOX_NAME: pfdeb12dev
 
 ########################################
+# BAKE_IMG JOBS
+########################################
+# One bake job per arch. Produces the per-pipeline golden Vagrant box that
+# test jobs (which extend .test_job_golden_<arch>) consume to skip site.yml
+# and the configurator wizard. Disabled for cluster/stable variants; only
+# the pfel8dev / pfdeb12dev standalones are baked.
+bake_img_vagrant_el8:
+  extends:
+    - .bake_img_vagrant_job
+    - .bake_img_vagrant_rules
+  variables:
+    BAKE_ARCH: el8
+    PF_VM_NAME: pfel8dev
+
+bake_img_vagrant_deb12:
+  extends:
+    - .bake_img_vagrant_job
+    - .bake_img_vagrant_rules
+  variables:
+    BAKE_ARCH: deb12
+    PF_VM_NAME: pfdeb12dev
+
+########################################
 #  BUILD_ARTIFACTS JOBS
 ########################################
 # build_artifacts_pkg jobs for development (devel)
@@ -1301,6 +1379,7 @@ unit_tests_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 configurator_el8:
   variables:
@@ -1341,6 +1420,7 @@ dot1x_eap_peap_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 dot1x_eap_peap_deb12:
   variables:
@@ -1349,6 +1429,7 @@ dot1x_eap_peap_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 mac_auth_el8:
   variables:
@@ -1357,6 +1438,7 @@ mac_auth_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 mac_auth_deb12:
   variables:
@@ -1365,6 +1447,7 @@ mac_auth_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 dot1x_eap_tls_el8:
   variables:
@@ -1373,6 +1456,7 @@ dot1x_eap_tls_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 dot1x_eap_tls_deb12:
   variables:
@@ -1381,6 +1465,7 @@ dot1x_eap_tls_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 fingerbank_invalid_db_deb12:
   variables:
@@ -1389,6 +1474,7 @@ fingerbank_invalid_db_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 security_events_deb12:
   variables:
@@ -1397,6 +1483,7 @@ security_events_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 cli_login_deb12:
   variables:
@@ -1405,6 +1492,7 @@ cli_login_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 cli_login_el8:
   variables:
@@ -1413,6 +1501,7 @@ cli_login_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 external_integrations_deb12:
   variables:
@@ -1421,6 +1510,7 @@ external_integrations_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 captive_portal_el8:
   variables:
@@ -1429,6 +1519,7 @@ captive_portal_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 captive_portal_deb12:
   variables:
@@ -1437,6 +1528,7 @@ captive_portal_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 inline_deb12:
   variables:
@@ -1445,6 +1537,7 @@ inline_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 inline_el8:
   variables:
@@ -1453,6 +1546,7 @@ inline_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 mac_auth_virtualswitch_el8:
   variables:
@@ -1461,6 +1555,7 @@ mac_auth_virtualswitch_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 mac_auth_virtualswitch_deb12:
   variables:
@@ -1469,6 +1564,7 @@ mac_auth_virtualswitch_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 device_profiling_virtualswitch_el8:
   variables:
@@ -1477,6 +1573,7 @@ device_profiling_virtualswitch_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 device_profiling_virtualswitch_deb12:
   variables:
@@ -1485,6 +1582,7 @@ device_profiling_virtualswitch_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 dot1x_wired_computer_auth_virtualswitch_el8:
   variables:
@@ -1493,6 +1591,7 @@ dot1x_wired_computer_auth_virtualswitch_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 dot1x_wired_computer_auth_virtualswitch_deb12:
   variables:
@@ -1501,6 +1600,7 @@ dot1x_wired_computer_auth_virtualswitch_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 pfacct_bandwidth_virtualswitch_el8:
   variables:
@@ -1509,6 +1609,7 @@ pfacct_bandwidth_virtualswitch_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 pfacct_bandwidth_virtualswitch_deb12:
   variables:
@@ -1517,6 +1618,7 @@ pfacct_bandwidth_virtualswitch_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 security_event_virtualswitch_el8:
   variables:
@@ -1525,6 +1627,7 @@ security_event_virtualswitch_el8:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_el8
 
 security_event_virtualswitch_deb12:
   variables:
@@ -1533,6 +1636,7 @@ security_event_virtualswitch_deb12:
     - .test_job
     - .test_script_job
     - .test_devel_and_maintenance_rules
+    - .test_job_golden_deb12
 
 ### development branches **only**
 # We force VAGRANT_COMMON_DOTFILE_PATH to a specific value
@@ -1544,6 +1648,7 @@ unit_tests_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 configurator_el8_branches:
   variables:
@@ -1589,6 +1694,7 @@ dot1x_eap_peap_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 dot1x_eap_peap_deb12_branches:
   variables:
@@ -1598,6 +1704,7 @@ dot1x_eap_peap_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 mac_auth_el8_branches:
   variables:
@@ -1607,6 +1714,7 @@ mac_auth_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 mac_auth_deb12_branches:
   variables:
@@ -1616,6 +1724,7 @@ mac_auth_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 dot1x_eap_tls_el8_branches:
   variables:
@@ -1625,6 +1734,7 @@ dot1x_eap_tls_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 dot1x_eap_tls_deb12_branches:
   variables:
@@ -1634,6 +1744,7 @@ dot1x_eap_tls_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 fingerbank_invalid_db_deb12_branches:
   variables:
@@ -1643,6 +1754,7 @@ fingerbank_invalid_db_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 security_events_deb12_branches:
   variables:
@@ -1652,6 +1764,7 @@ security_events_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 cli_login_deb12_branches:
   variables:
@@ -1661,6 +1774,7 @@ cli_login_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 cli_login_el8_branches:
   variables:
@@ -1670,6 +1784,7 @@ cli_login_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 external_integrations_deb12_branches:
   variables:
@@ -1679,6 +1794,7 @@ external_integrations_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 captive_portal_el8_branches:
   variables:
@@ -1688,6 +1804,7 @@ captive_portal_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 captive_portal_deb12_branches:
   variables:
@@ -1697,6 +1814,7 @@ captive_portal_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 inline_deb12_branches:
   variables:
@@ -1706,6 +1824,7 @@ inline_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 inline_el8_branches:
   variables:
@@ -1715,6 +1834,7 @@ inline_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 mac_auth_virtualswitch_el8_branches:
   variables:
@@ -1724,6 +1844,7 @@ mac_auth_virtualswitch_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 mac_auth_virtualswitch_deb12_branches:
   variables:
@@ -1733,6 +1854,7 @@ mac_auth_virtualswitch_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 device_profiling_virtualswitch_el8_branches:
   variables:
@@ -1742,6 +1864,7 @@ device_profiling_virtualswitch_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 device_profiling_virtualswitch_deb12_branches:
   variables:
@@ -1751,6 +1874,7 @@ device_profiling_virtualswitch_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 dot1x_wired_computer_auth_virtualswitch_el8_branches:
   variables:
@@ -1760,6 +1884,7 @@ dot1x_wired_computer_auth_virtualswitch_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 dot1x_wired_computer_auth_virtualswitch_deb12_branches:
   variables:
@@ -1769,6 +1894,7 @@ dot1x_wired_computer_auth_virtualswitch_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 pfacct_bandwidth_virtualswitch_el8_branches:
   variables:
@@ -1778,6 +1904,7 @@ pfacct_bandwidth_virtualswitch_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 pfacct_bandwidth_virtualswitch_deb12_branches:
   variables:
@@ -1787,6 +1914,7 @@ pfacct_bandwidth_virtualswitch_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 security_event_virtualswitch_el8_branches:
   variables:
@@ -1796,6 +1924,7 @@ security_event_virtualswitch_el8_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_el8
 
 security_event_virtualswitch_deb12_branches:
   variables:
@@ -1805,6 +1934,7 @@ security_event_virtualswitch_deb12_branches:
     - .test_job
     - .test_script_job
     - .test_branches_only_rules
+    - .test_job_golden_deb12
 
 ### release
 configurator_el8_pristine:
@@ -1953,6 +2083,33 @@ deploy_release_website_artifacts:
   extends:
     - .deploy_website_artifacts_job
     - .release_only_rules
+
+# Purge the per-pipeline golden image directory written by the bake jobs.
+# Rules mirror .bake_img_vagrant_rules but each entry sets `when: always` so
+# cleanup runs even if test jobs failed. Inlining rather than extending
+# .bake_img_vagrant_rules because GitLab CI doesn't propagate a job-level
+# `when:` into rules inherited via `extends:`.
+cleanup_golden_images:
+  stage: deploy
+  needs: []
+  dependencies: []
+  variables:
+    GOLDEN_BOX_DIR: /var/local/gitlab-runner/golden_images/${CI_PIPELINE_ID}
+  script:
+    - timeout ${PIPELINE_TIMEOUT_CLEANUP} ${CILIBDIR}/test/cleanup-golden-images.sh
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == "devel" && $CI_PIPELINE_SOURCE != "schedule" && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+      when: always
+    - if: '$CI_COMMIT_REF_NAME =~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+      when: always
+    - if: '( $CI_COMMIT_REF_NAME == "devel" || $CI_COMMIT_REF_NAME =~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/) && $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_TAG == null && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+      when: always
+    - if: '$CI_COMMIT_REF_NAME != "devel" && $CI_COMMIT_REF_NAME !~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && ($CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api") && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+      when: always
+    - if: '$CI_COMMIT_REF_NAME != "devel" && $CI_COMMIT_REF_NAME !~ /^maintenance\/[[:digit:]]+\.[[:digit:]]+$/ && $CI_COMMIT_TAG == null && $CI_PIPELINE_SOURCE == "schedule" && ( $TEST == "yes" || $CI_COMMIT_MESSAGE =~ /test=yes/ )'
+      when: always
+  tags:
+    - test-shell-v7
 
 ########################################
 # BUILD_PF_IMG JOBS
